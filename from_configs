@@ -1,0 +1,544 @@
+/*** set up is: different macros to 
+1) to simulate outcomes;
+2) to analyze outcomes (in different ways) and save results to a dataset (one record per analysis of one simulation run);
+3) to explore different configurations i.e. scenarios that are given by an input file;
+Then postprocessing:
+* tables
+* graphics
+
+Here is an example for type I error and power
+**/
+
+
+**********************************************************************************************************;
+************** macros*************************************************************************************;
+**********************************************************************************************************;
+** %macro sim_outcomes(ds_sim=ds_sim,seed=37,
+n_sim=, n_clus0=,n_clus1=, n_subj0=, n_subj1=, 
+ s2_c=, s2_ct0=, s2_s=, s2_st0=, s2_0ct1=, s2_0st1=, s2_1ct1=,s2_1st1=,
+ fe_t0=, fe_t1=, delta=, 
+name_config=notspecified
+);
+*notation: fe=fixed effect (for time=0,1), s2=variances of random effect/components ;
+data &ds_sim; length name_config $ 100;
+name_config="&name_config"; * unique name to identify the configuration;
+k0=&n_clus0; k1=&n_clus1; n0=&n_subj0; n1=&n_subj1;
+array n_clus {0:1} k0 k1;
+array n_subj {0:1} n0 n1;
+* the variance components from the correlations to total SDs; 
+s2_c= &s2_c; s2_ct0=&s2_ct0;
+s2_s= &s2_s;  s2_st0=&s2_st0;
+s2_0ct1= &s2_0ct1; s2_0st1= &s2_0st1;
+s2_1ct1= &s2_1ct1;s2_1st1= &s2_1st1;
+* set seed to reproduce the simulation;
+call streaminit(&seed);
+* subjects are (clus,subj)-indexed according to their allocation at follow-up;
+* e.g. if no clustering at baseline then s2_c=s2_ct0=0 so subjects are in clusters with ICC=0;
+* clusters can be of size 1 if they are individuals;
+do sim=1 to &n_sim;
+ do tx=0 to 1; * treatment is constant over clusters (Situation 1-3);
+   * random intercepts for each cluster, and random cluster x time interaction for t0 and t1;
+   do clus=1 to n_clus{tx};rclus=rand("Normal"); rclus_t0=rand("Normal"); rclus_t1=rand("Normal"); 
+     * random intercept for each subject, random subject x time interaction for t0 and t1;
+     do subj=1 to n_subj{tx};rsubj=rand("Normal"); rsubj_t0=rand("Normal");rsubj_t1=rand("Normal");
+	   * generate longitudinal data;
+  	   do time=0 to 1; 
+	     do hypo=0 to 1;
+		 * only a treatment effect for tx=1 at time=1 if hypo=1;
+		 fixed_effects=(time=0)*&fe_t0 + (time=1)*&fe_t1 + (time=1)*(hypo=1)*(tx=1)*&delta;
+         * a cluster (hence its subjects) has either tx=0 or tx=1, so below: (tx=0)*.. =0 or (tx=1)*.. =0;
+		 * therefore we can suffice with one rclus_t1 rsubj_t1 regardless of tx=0,1;
+		 random_effects= sqrt(s2_c)*rclus + sqrt(s2_s)*rsubj 
+                       + (time=0)*(  sqrt(s2_ct0)*rclus_t0 + sqrt(s2_st0)*rsubj_t0  ) 
+                       + (time=1)*(	
+									(tx=0)*(  sqrt(s2_0ct1)*rclus_t1 + sqrt(s2_0st1)*rsubj_t1  )
+									  +
+                       				(tx=1)*(  sqrt(s2_1ct1)*rclus_t1 + sqrt(s2_1st1)*rsubj_t1  )
+								   );
+		outcome=fixed_effects + random_effects;
+		* dummy variables useful for the analyses;
+		t1=(time=1); t1_g0=(time=1)*(tx=0); t1_g0_class=t1_g0;t1_g1=(time=1)*(tx=1);t1_g1_class=t1_g1;
+		ctl_clus= (tx=1)*clus; * so =0 for all in ctl arm, =j for cluster j in intervention arm;
+        output;
+end;end;end;end;end;end;
+run; 
+%mend sim_outcomes;
+
+
+%macro analyze_outcomes(ds_sim=ds_sim, name_config=name_config, alpha=0.05,
+						ds_conv=ds_conv,ds_feparms=ds_feparms, ds_covparms=ds_covparms, ds_cellavg=ds_cellavg);
+** analyses must be specified as: by name_config hypo sim , and use the variables as present in &ds_sim;
+** below analyses are for independent subjects at baseline and at follow-up: 
+	  subjects in the ctl arm and clusters in the intervention arm;  
+title6 "post-test analysis";
+	ods output ConvergenceStatus= _conv;
+	ods output Covparms=_covparms;
+	ods output SolutionF=_solutionf;
+proc mixed data=&ds_sim(where=(time=1)); * only follow-up measurement;
+by name_config hypo sim;
+class clus subj t1_g1_class;
+model outcome=tx / solution alpha=&alpha ddfm=kr;
+random t1_g1 / subject=clus V Vcorr; * random slope for clusters in the intv arm at fu;
+repeated / subject=subj(clus) group=t1_g1_class R Rcorr; *different residuals for intv arm at fu;
+run;
+	ods output close;
+	* length statement to create same length for combining these datasets later;
+	data _conv_pt; set _conv;length type_analysis $ 100; type_analysis="posttest";run;
+	data _cov_pt; length covparm $ 20; length subject $ 20;set _covparms;  length type_analysis $ 100; type_analysis="posttest";run;
+	data _fe_pt; length effect $ 20; set _solutionf; length type_analysis $ 100; type_analysis="posttest";if effect="tx";run;
+
+
+title6 "ancova analysis on individual data";
+	ods output ConvergenceStatus= _conv;
+	ods output Covparms=_covparms;
+	ods output SolutionF=_solutionF;
+proc mixed data=&ds_sim; 
+by name_config hypo sim;
+class clus subj t1_g1_class;
+model outcome=t1 t1*tx / solution alpha=&alpha ddfm=kr; 
+random t1_g1 / subject=clus V Vcorr; * random slope for clusters in intervention arm at fu;
+random intercept /subject=subj(clus) V Vcorr; *random intercept for subjects;
+repeated / subject=time(subj*clus) type=vc group=t1_g1_class R Rcorr; *different residuals for intv arm at fu;
+run;
+	ods output close;
+	* length statement to create same length for combining these datasets later;
+	data _conv_anc_ind; set _conv;length type_analysis $ 100; type_analysis="ancova indiv";run;
+	data _cov_anc_ind; length covparm $ 20;; length subject $ 20;;set _covparms; length type_analysis $ 100; type_analysis="ancova indiv";run;
+	data _fe_anc_ind;length effect $ 20; set _solutionf; length type_analysis $ 100; type_analysis="ancova indiv";if effect="t1*tx";run;
+
+title6 "ancova analysis on cluster means";
+* calculate cluster-time means;
+proc means data=&ds_sim mean var nway noprint; by name_config hypo sim tx; class clus time;
+		var outcome t1; 
+		output out=_cellavg mean=outcome_clusavg t1 var=outcome_variance t1_variance; run;
+* analyze;
+	ods output ConvergenceStatus= _conv;
+	ods output Covparms=_covparms;
+	ods output SolutionF=_solutionf;
+proc mixed data=_cellavg;
+by name_config hypo sim;
+model outcome_clusavg= t1 t1*tx / solution ddfm=kr;
+repeated / subject=clus type=csh group=tx; 
+* what we loose is that type=cs in ctl arm ;
+* and the (residual) variance is the same at baseline (both arms) and ct arm at fu;
+* and at t=1: variance s2 (subjects) is related to variance tau2 by tau2=s2/n, with n the number of subjects;
+run;
+	ods output close;
+	* length statement to create same length for combining these datasets later;
+	data _conv_anc_clus; set _conv;length type_analysis $ 100; type_analysis="ancova clusavg";run;
+	data _cov_anc_clus; length covparm $ 20;; length subject $ 20;set _covparms; length type_analysis $ 100; type_analysis="ancova clusavg";run;
+	data _fe_anc_clus; length effect $ 20; set _solutionf; length type_analysis $ 100; type_analysis="ancova clusavg";if effect="t1*tx";run;
+
+title6 " "; * clear title;
+
+*write estimated parameters to output datasets;
+data &ds_conv; set _conv_pt _conv_anc_ind _conv_anc_clus;run;
+data &ds_feparms; set _fe_pt _fe_anc_ind _fe_anc_clus;run;
+data &ds_covparms; set _cov_pt _cov_anc_ind _cov_anc_clus;run;
+data &ds_cellavg; set _cellavg; drop t1_variance;run;
+
+*clean-up;
+/*proc datasets nolist; 
+delete _: ; * delete temporary datasets; 
+run; quit;*/
+
+%mend analyze_outcomes;
+
+
+
+
+
+%macro explore_configs(ds_config=, dir=%str(".";),  n_sim=, seed=37, verbose=0);
+
+** the dataset ds_config must contain at least the variables
+** n_sim=, n_clus0=,n_clus1=, n_subj0=, n_subj1=, 
+ s2_c=, s2_ct0=, s2_s=, s2_st0=, s2_0ct1=, s2_0st1=, s2_1ct1=,s2_1st1=,
+ ftime_t0=, ftime_t1=, delta=;
+
+* possible code to check whether translation of correlations, sd to variances
+* went ok;
+* stop program if the conditions on correlations are not satisfied;
+*if min(s2_0ct1,s2_0st1,s2_1ct1,s2_1st1)< 0 then do;
+*	put "ERROR: correlations not in range to get positive variance components, execution stopped";
+	* possibly add more details; 
+*	stop;
+*end;
+
+* set the folder for the output dataset ;
+libname dir &dir;
+    
+*** detemine how many configurations (i.e. how many records in &ds_config) ***;
+data _null_;
+    dsid= open("&ds_config");
+    n_config= attrn(dsid,"nlobs");
+    call symput('n_config', trim(left(n_config)));
+run;    
+%put n_config is &n_config;
+
+*** iterate over the (macro) parameters from the configuration file;
+%DO config=1 %TO &n_config;
+
+   	*** get the macro parameters from the dataline with number &config**;
+	data _null_; set &ds_config; 
+		if _n_=&config;
+     	array npar{*} _numeric_; * all numeric variables in an array;
+     	do i=1 to dim(npar); * assign variables to macro variables with the same name;
+        	call symput(vname(npar{i}), compress(trim(npar{i})));
+     	end;
+		call symput('name_config',compress(trim(name_config)) );* assign the name of the config; 
+		datetime = put(datetime(), datetime19.);call symput('datetime',datetime);* time;
+   	run;
+
+  	* keep track of progress of this macro;
+  	%put configuration &config of &n_config started at &datetime; 
+	%put &name_config;
+
+  	* suppress output, unless otherwise requested;
+	%IF &verbose ne 0 %THEN %DO; %END;
+	%ELSE %DO; ods exclude all; ods results off; options nonotes;%END;
+
+  	* generate outcomes;
+  	%sim_outcomes(ds_sim=ds_sim, seed=&seed, 
+		n_sim=&n_sim, n_clus0=&n_clus0,n_clus1=&n_clus1, n_subj0=&n_subj0, n_subj1=&n_subj1, 
+ 		s2_c=&s2_c, s2_ct0=&s2_ct0, s2_s=&s2_s, s2_st0=&s2_st0, 
+		s2_0ct1=&s2_0ct1, s2_0st1=&s2_0st1, s2_1ct1=&s2_1ct1,s2_1st1=&s2_1st1,
+ 		fe_t0=&fe_t0, fe_t1=&fe_t1, delta=&delta, 
+		name_config=&name_config
+		);
+	
+    *title6 "tx by time averages and variances";
+	proc sort data=ds_sim; by hypo sim tx clus subj;
+	proc means data=ds_sim(where=(hypo=0)) n mean std var; class tx time; var outcome;run;
+
+	%analyze_outcomes(ds_sim=ds_sim, ds_feparms=dir.feparms_&name_config, 
+                      ds_covparms=dir.covparms_&name_config,ds_conv=dir.conv_&name_config);
+
+	* output on again;
+	ods exclude none; ods results; options notes; 
+%END;
+
+
+%mend explore_configs;
+
+
+**********************************************************************************************************;
+************** simulate scenarios ************************************************************************;
+**********************************************************************************************************;
+
+
+** for partially cluster randomized design
+** calculate delta, given se for a configuration of variance components;
+data config;length name_config $ 100;length df_method $ 20;
+counter=.;* counter of the number of configurations; 
+power=0.8; alpha=0.05;
+fe_t0=0; fe_t1=1;
+do n_clus1=20,25; 
+n_subj1=4;
+n_clus0=n_clus1*n_subj1; 
+n_subj0=1;
+	do rho_1=0.05,0.10,0.20; 
+	* partially nested design;
+	s2_s=0.7; s2_st0=0.3; *so s2_ind=1;
+	s2_0st1=s2_st0;
+	s2_c=0; s2_ct0=0; s2_0ct1=0; 
+		* intermediate steps;
+		s2_base=s2_s + s2_st0; 
+		r=s2_s/s2_base;	
+		s2_0fu=s2_base; * variance of subject at follow-up in the ctl arm;
+		* variance components;
+		do factor=0.5, 1,2;
+		s2_1st1=factor*s2_st0;
+		s2_1ct1=(s2_s + s2_1st1)* rho_1/(1-rho_1);
+		s2_1fu= s2_1ct1 + s2_s + s2_1st1; 
+		de_1= 1+ (n_subj1-1)*rho_1;
+		A_1=de_1*s2_1fu - r**2 *s2_base;
+		A_0 = (1-r**2)*s2_base;
+		* optimal number of ctl "clusters"/subjects;
+		*n_clus0=ceil( n_clus1*n_subj1*sqrt(A_0)/sqrt(A_1) );
+		*n_clus0=max(1,n_clus0); * to avoid 0;
+		* calculation standard error;
+		se2= A_1/(n_clus1*n_subj1) + A_0/(n_clus0*n_subj0); 
+		se2_posttest=de_1*s2_1fu/(n_clus1*n_subj1) + s2_base/(n_clus0*n_subj0);
+		* various choices for df;
+		n_eff1=n_clus1*n_subj1/de_1; n_eff0=n_clus0*n_subj0;* effective cluster sizes;
+		satterth_num=  (s2_1fu/n_eff1 + s2_0fu/n_eff0)**2 ;
+		satterth_denom= (s2_1fu/n_eff1)**2/(n_eff1 -1) + (s2_0fu/n_eff0)**2/(n_eff0 -1);
+		df_satterth=satterth_num/satterth_denom;
+    	df_tclus=n_clus1 + n_clus0-2;* based on total number of clusters as in a t-test;
+    	df_eff=(n_clus1*n_subj1/de_1 + n_clus0-2); * based on effective sample size, too optimistic;
+		df_nclus=n_clus1 + n_clus0; 
+			do df_method="satterthwaite","total #clusters -2";
+			if df_method="satterthwaite" then df=df_satterth;
+			else if df_method="total #clusters -2" then df=df_tclus;
+			* inflation of se (similar idea to Kenward-Rogers df);
+			phi=1; *1.20 for two clusters;
+			* size of effect based on standard error and proposed df;
+			delta=phi*sqrt(se2)*( tinv(power,df) + tinv(1-alpha/2,df) );
+			delta_posttest=phi*sqrt(se2_posttest)*( tinv(power,df) + tinv(1-alpha/2,df) );
+			* name less than 32 characters to be used as dataset name;
+			counter+1;
+			name_config=cat('config',counter);;
+			output;
+end;end;end;end;
+run;
+
+
+
+* options mprint mlogic symbolgen;* macro debugging options;
+* options nomprint nomlogic nosymbolgen;
+
+
+**** now simulate and check power, for one selected config, check estimated random and fixed effects;;
+
+%explore_configs(ds_config=config, n_sim=2000);
+
+**********************************************************************************************************;
+************** post processing: tables********************************************************************;
+**********************************************************************************************************;
+
+
+libname dir ".";
+
+data feparms;
+set dir.feparms_: ;*combine feparms_... across all configurations; 
+if probt ne . then reject=(probt < 0.05); *calculate rejection rate;
+/* 
+*calculate adapted standard errors to correct type I error;
+t_corr=estimate/(1.15*stderr); p_corr=2*(1-probt(abs(t_corr),df));
+if probt ne . then reject_corr=(p_corr < 0.05);
+*/
+se_emp=stderr;
+run;
+
+data conv;
+set dir.conv_: ;
+run;
+
+
+proc sort data=feparms; by name_config type_analysis hypo sim;run;
+proc sort data=conv;by name_config type_analysis hypo sim; run;
+* note the number of records is #name_config * #type_analysis * #hypo (=2) * #sim ; 
+data feparms_conv; merge conv feparms;by name_config type_analysis hypo sim;run;
+
+title "some non-converged analyses may give estimates, stderr, and p-values, and vice versa";
+proc means data=feparms_conv n nmiss;class status; var estimate se_emp probt;run; 
+
+
+
+title "calculate rejection rate and estimated effect based on CONV+NON-CONV analyses that give pvalues";
+ods exclude all; ods results off;
+ods output summary=summary;
+proc means data=feparms n mean ;
+class name_config type_analysis hypo ; 
+var reject  estimate se_emp; *reject_corr;
+run;
+ods exclude none; ods results;
+ods output close;
+* add the simulation parameters to the summary, using unique combination of identifyers, this may may name_config;
+proc sort data=config; by name_config;run;
+proc sort data=summary; by name_config;run;
+data summary_config; merge config summary; by name_config;run;
+
+
+proc sort data=summary_config; by n_clus1 n_subj1 n_clus0 rho_1 factor hypo type_analysis  ;
+* write output summary;
+data dir.summary_config ; set summary_config; se=sqrt(se2);se_posttest=sqrt(se2_posttest); run;
+* print summary to .lst file;
+proc print data=dir.summary_config; by n_clus1 n_subj1 n_clus0 rho_1 factor;
+var  hypo type_analysis df_method df delta delta_posttest reject_n reject_mean  estimate_mean name_config 
+     se se_posttest se_emp_mean;* reject_corr_mean;
+run;
+
+title "calculate rejection rate and estimated effect *ONLY* on converged analyses";
+ods exclude all; ods results off;
+ods output summary=summary_conv;
+proc means data=feparms_conv n mean ;where status=0; * only the converged;
+class name_config type_analysis hypo ; 
+var reject  estimate se_emp; *reject_corr;
+run;
+ods exclude none; ods results;
+ods output close;
+* add the simulation parameters to the summary, using unique combination of identifyers, this may may name_config;
+proc sort data=config; by name_config;run;
+proc sort data=summary_conv; by name_config;run;
+data summary_config_conv; merge config summary_conv; by name_config;run;
+
+
+proc sort data=summary_config_conv; by n_clus1 n_subj1 n_clus0 rho_1 factor hypo type_analysis  ;
+* write output summary;
+data dir.summary_config_conv ; set summary_config_conv; se=sqrt(se2);se_posttest=sqrt(se2_posttest); run;
+* print summary to .lst file;
+proc print data=dir.summary_config_conv; by n_clus1 n_subj1 n_clus0 rho_1 factor;
+var  hypo type_analysis df_method df delta delta_posttest reject_n reject_mean  estimate_mean name_config 
+     se se_posttest se_emp_mean;* reject_corr_mean;
+run;
+
+
+title "calculate non-convergence rate";
+* mean of the non-convergence indicator;
+proc sort data=conv; by name_config type_analysis hypo sim;run;
+ods exclude all; ods results off;
+ods output summary=summary_nonconv; 
+proc means data=conv n mean; 
+class name_config type_analysis hypo;
+var status; *0= converged, 1= not converged;
+run;
+ods exclude none; ods results;
+* add details of configurations ;
+proc sort data=config; by name_config; run;
+data summary_config_nonconv; merge config summary_nonconv; by name_config;run;
+
+proc sort data=summary_config_nonconv; by n_clus1 n_subj1 n_clus0 rho_1 factor;run;
+* write output summary;
+data dir.summary_config_nonconv; set summary_config_nonconv;run;
+* print summary to .lst file;
+proc print data=dir.summary_config_nonconv; by n_clus1 n_subj1 n_clus0 rho_1 factor;
+var  hypo type_analysis df_method df delta delta_posttest status_n status_mean;
+run;
+
+**********************************************************************************************************;
+************** post-processing: graphics******************************************************************;
+**********************************************************************************************************;
+** look at https://ebookreading.net/view/book/EB9781629602059_13.html#Toc442353198;
+
+* read the files with the analysis results **;
+libname parent1 "..\n clusters 2,3, 4, 5, 6\";
+libname parent2 "..\n clusters 8,10,15\";
+libname parent3 "..\n clusters 20,25\";
+
+
+********** type I error and power for all analyses (simulations) that produce p-value; 
+data summary_config_all; 
+set parent1.summary_config parent2.summary_config parent3.summary_config;
+run;
+
+data summary_config_all; set summary_config_all;
+if df_method="total #clusters -2";
+run;
+
+data t1e; set summary_config_all;
+if hypo=0;
+run;
+
+data power; set summary_config_all;
+if hypo=1;
+run;
+
+proc print data=t1e noobs; var n_clus1 n_subj1 n_clus0 n_subj0 rho_1 factor type_analysis reject_mean;run;
+
+proc print data=power noobs; var n_clus1 n_subj1 n_clus0 n_subj0 rho_1 factor type_analysis reject_mean;
+where n_clus1=5 and type_analysis="ancova clusavg";run;
+
+
+options orientation=landscape;
+proc sgpanel data=t1e; *(where=(type_analysis="posttest"));
+panelby factor rho_1 /layout=lattice;
+series x=n_clus1 y=reject_mean /group=type_analysis;
+scatter x=n_clus1 y=reject_mean /group=type_analysis; ;
+colaxis values=(2 5 10 15 20 25 );
+run;
+
+options orientation=landscape;
+proc sgpanel data=power;
+panelby factor rho_1 /layout=lattice;
+series x=n_clus1 y=reject_mean /group=type_analysis;
+scatter x=n_clus1 y=reject_mean /group=type_analysis; ;
+colaxis values=(2 5 10 15 20 25 );
+run;
+
+
+
+*********type I error and power for  only the converged analyses/simulations ones **************************;
+data summary_config_all_conv; 
+set parent1.summary_config_conv parent2.summary_config_conv parent3.summary_config_conv;
+run;
+
+data summary_config_all_conv; set summary_config_all_conv;
+if df_method="total #clusters -2";
+run;
+
+data t1e; set summary_config_all_conv;
+if hypo=0;
+run;
+
+data power; set summary_config_all_conv;
+if hypo=1;
+run;
+
+proc print data=t1e noobs; var n_clus1 n_subj1 n_clus0 n_subj0 rho_1 factor type_analysis reject_mean;run;
+
+proc print data=power noobs; var n_clus1 n_subj1 n_clus0 n_subj0 rho_1 factor type_analysis reject_mean;
+run;
+
+ods pdf file="figure3_t1e.pdf" ;
+
+proc format;
+value factorf 0.5="res.var.ratio:  0.5" 1="1.0" 2="2.0";
+value rho_1f 0.2="ICC:   0.20" 0.1="0.10" 0.05="0.05";
+run;
+proc sort data=t1e;by type_analysis;run;
+
+ods graphics on / attrpriority=none  width=20cm height=20cm noborder ;* to use styleattrs function below;
+options orientation=landscape nodate nonumber;
+
+proc sgpanel data=t1e ; 
+format factor factorf.;format rho_1 rho_1f.; label type_analysis="type analysis";
+panelby factor rho_1 /layout=lattice novarname;
+styleattrs datasymbols=(circle squarefilled starfilled) datalinepatterns=(solid dash shortdash);
+scatter x=n_clus1 y=reject_mean /group=type_analysis markerattrs=(size=5.5pt); 
+series x=n_clus1 y=reject_mean /group=type_analysis lineattrs=(thickness=0.5pt);
+rowaxis label="rejection rate";
+colaxis values=(2 5 10 15 20 25 ) label="number clusters in intervention arm: 2, 3, 4, 5, 6, 8, 10, 15, 20, 25";
+run;
+ods pfd close;
+
+ods pdf file="figure4_power.pdf";
+proc sort data=power;by type_analysis;run;
+proc sgpanel data=power;
+format factor factorf.;format rho_1 rho_1f.; label type_analysis="type analysis";
+panelby factor rho_1 /layout=lattice novarname;
+styleattrs datasymbols=(circle squarefilled starfilled) datalinepatterns=(solid dash shortdash);
+scatter x=n_clus1 y=reject_mean /group=type_analysis markerattrs=(size=5.5pt); ;
+series x=n_clus1 y=reject_mean /group=type_analysis lineattrs=(thickness=0.5pt);;
+rowaxis label="rejection rate";
+colaxis values=(2 5 10 15 20 25 ) label="number clusters in intervention arm: 2, 3, 4, 5, 6, 8, 10, 15, 20, 25";
+run;
+ods pdf close;
+
+
+************the convergence rate ****************;
+data summary_config_all_nonconv;
+set parent1.summary_config_nonconv 
+	parent2.summary_config_nonconv 
+	parent3.summary_config_nonconv
+;run; 
+
+data summary_config_all_nonconv; set summary_config_all_nonconv;
+if df_method="total #clusters -2";
+run;
+
+data nonconvergence_h0; set summary_config_all_nonconv;
+if hypo=0;
+run;
+
+proc sort data=nonconvergence_h0; by type_analysis;run;
+proc tabulate data=nonconvergence_h0;
+by type_analysis;
+class n_clus1 factor rho_1;
+var status_mean;
+table n_clus1, factor*rho_1*(status_mean=" ")*(min=" ")*(f=6.5);
+run;
+
+
+
+*ods pdf file="Figure_nonconvergence";
+proc sgpanel data=nonconvergence_h0;
+panelby factor rho_1 / novarname layout=lattice;
+series x=n_clus1 y=status_mean /group=type_analysis;
+rowaxis min=0 max=0.01;
+colaxis values=(2,4,6,8,10,15,20);
+run;
+*ods pdf close;
+ 
+
+
